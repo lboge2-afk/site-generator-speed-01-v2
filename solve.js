@@ -374,6 +374,9 @@ const CONSTRUCT_RE = /[\\`*[]/g;
 
 /** `s` rendered inline; `env.link(target)` is a link's href. */
 function inline(s, env) {
+  // Fast path: no inline construct at all — skip the out array and the join.
+  CONSTRUCT_RE.lastIndex = 0;
+  if (CONSTRUCT_RE.exec(s) === null) return escapeHtml(s);
   const out = [];
   let i = 0;
   while (i < s.length) {
@@ -682,9 +685,14 @@ function renderNodes(nodes, scope, ctx, depth, out) {
       case 'for': {
         const xs = lookup(scope, n.path);
         if (!Array.isArray(xs)) break;
+        // One child scope per for-node, its vars mutated per iteration: the body is
+        // rendered synchronously, so nothing holds the scope past its iteration.
+        const childVars = {};
+        const child = { vars: childVars, parent: scope };
         for (let k = 0; k < xs.length; k++) {
-          const vars = { [n.name]: xs[k], loop: { index: k + 1, first: k === 0, last: k === xs.length - 1, length: xs.length } };
-          renderNodes(n.body, { vars, parent: scope }, ctx, depth, out);
+          childVars[n.name] = xs[k];
+          childVars.loop = { index: k + 1, first: k === 0, last: k === xs.length - 1, length: xs.length };
+          renderNodes(n.body, child, ctx, depth, out);
         }
         break;
       }
@@ -943,11 +951,14 @@ export function build(input) {
     const allTags = b.tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
     const recent = b.posts.slice(0, b.input.site.recent).map((p) => b.cards.get(p));
     const ctx = { templates: b.templates, escape: escapeHtml, staticTemplates, staticCache: new Map() };
+    // One shared build scope (site/tags/recent); each render's own vars hang off it
+    // as a child scope, so no per-render spread of the build-level vars.
+    const buildScope = { vars: { site, tags: allTags, recent }, parent: null };
     const render = (name, vars) => {
       const nodes = b.templates.get(name);
       if (nodes === undefined) return null;
       const out = [];
-      renderNodes(nodes, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, ctx, 0, out);
+      renderNodes(nodes, { vars, parent: buildScope }, ctx, 0, out);
       return out.join('');
     };
     for (const s of b.sources) b.output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });
