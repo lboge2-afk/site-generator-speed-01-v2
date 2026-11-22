@@ -9,9 +9,11 @@ const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 // ---------------------------------------------------------------- text
 
 const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+const ESC_RE = /[&<>"']/;
 
 /** `text` with & < > " and ' escaped. Fast: returns the input when it holds none of them. */
 export function escapeHtml(text) {
+  if (!ESC_RE.test(text)) return text;
   let out = '';
   let start = 0;
   const n = text.length;
@@ -225,66 +227,105 @@ function headingOf(line) {
 }
 
 function endsParagraph(line) {
-  return BLANK.test(line) || FENCE_OPEN.test(line) || headingOf(line) !== null || HR.test(line);
+  if (line === '') return true;
+  const c0 = line.charCodeAt(0);
+  if (c0 === 32 || c0 === 9) return BLANK.test(line);
+  if (c0 === 96) return FENCE_OPEN.test(line);
+  if (c0 === 35) return headingOf(line) !== null;
+  if (c0 === 45 || c0 === 42) return HR.test(line);
+  return false;
 }
 
-const trimLine = (line) => line.replace(/^[ \t]+|[ \t]+$/g, '');
+const trimLine = (line) => {
+  if (line === '') return line;
+  const c0 = line.charCodeAt(0);
+  const c1 = line.charCodeAt(line.length - 1);
+  if (c0 !== 32 && c0 !== 9 && c1 !== 32 && c1 !== 9) return line;
+  return line.replace(/^[ \t]+|[ \t]+$/g, '');
+};
 
-/** `src`'s block tokens, in order. */
+/** `src`'s block tokens, in order. Lines are classified by their first character, so most lines test no regex at all. */
 function lex(src) {
   const lines = src.split('\n');
   const tokens = [];
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
-    if (BLANK.test(line)) {
+    if (line === '') {
       i++;
       continue;
     }
-    const fence = FENCE_OPEN.exec(line);
-    if (fence !== null) {
+    const c0 = line.charCodeAt(0);
+    if (c0 === 32 || c0 === 9) {
+      // Space/tab start: blank (all whitespace) or a paragraph line.
+      if (BLANK.test(line)) {
+        i++;
+        continue;
+      }
+    } else if (c0 === 96) {
+      const fence = FENCE_OPEN.exec(line);
+      if (fence !== null) {
+        const body = [];
+        i++;
+        while (i < lines.length && !FENCE_CLOSE.test(lines[i])) body.push(lines[i++]);
+        i++;
+        tokens.push({ type: 'code', lang: fence[1], lines: body });
+        continue;
+      }
+    } else if (c0 === 35) {
+      const heading = headingOf(line);
+      if (heading !== null) {
+        tokens.push({ type: 'heading', depth: heading.depth, text: heading.text });
+        i++;
+        continue;
+      }
+    } else if (c0 === 45 || c0 === 42) {
+      if (HR.test(line)) {
+        tokens.push({ type: 'hr' });
+        i++;
+        continue;
+      }
+      const bullet = BULLET.exec(line);
+      if (bullet !== null) {
+        const items = [];
+        while (i < lines.length) {
+          const m = BULLET.exec(lines[i]);
+          if (m !== null) {
+            items.push([trimLine(m[1])]);
+            i++;
+          } else if (CONTINUED.test(lines[i])) {
+            items[items.length - 1].push(trimLine(lines[i]));
+            i++;
+          } else break;
+        }
+        tokens.push({ type: 'list', ordered: false, start: 1, items: items.map((parts) => parts.join('\n')) });
+        continue;
+      }
+    } else if (c0 === 62) {
       const body = [];
-      i++;
-      while (i < lines.length && !FENCE_CLOSE.test(lines[i])) body.push(lines[i++]);
-      i++;
-      tokens.push({ type: 'code', lang: fence[1], lines: body });
-      continue;
-    }
-    const heading = headingOf(line);
-    if (heading !== null) {
-      tokens.push({ type: 'heading', depth: heading.depth, text: heading.text });
-      i++;
-      continue;
-    }
-    if (HR.test(line)) {
-      tokens.push({ type: 'hr' });
-      i++;
-      continue;
-    }
-    if (QUOTE.test(line)) {
-      const body = [];
-      while (i < lines.length && QUOTE.test(lines[i])) body.push(lines[i++].replace(/^> ?/, ''));
+      while (i < lines.length && QUOTE.test(lines[i])) {
+        const q = lines[i++];
+        body.push(q.charCodeAt(1) === 32 ? q.slice(2) : q.slice(1));
+      }
       tokens.push({ type: 'blockquote', lines: body.map(trimLine).filter((l) => l !== '') });
       continue;
-    }
-    const bullet = BULLET.exec(line);
-    const ordered = bullet === null ? ORDERED.exec(line) : null;
-    if (bullet !== null || ordered !== null) {
-      const isOrdered = ordered !== null;
-      const marker = isOrdered ? ORDERED : BULLET;
-      const items = [];
-      while (i < lines.length) {
-        const m = marker.exec(lines[i]);
-        if (m !== null) {
-          items.push([trimLine(isOrdered ? m[2] : m[1])]);
-          i++;
-        } else if (CONTINUED.test(lines[i])) {
-          items[items.length - 1].push(trimLine(lines[i]));
-          i++;
-        } else break;
+    } else if (c0 >= 48 && c0 <= 57) {
+      const ordered = ORDERED.exec(line);
+      if (ordered !== null) {
+        const items = [];
+        while (i < lines.length) {
+          const m = ORDERED.exec(lines[i]);
+          if (m !== null) {
+            items.push([trimLine(m[2])]);
+            i++;
+          } else if (CONTINUED.test(lines[i])) {
+            items[items.length - 1].push(trimLine(lines[i]));
+            i++;
+          } else break;
+        }
+        tokens.push({ type: 'list', ordered: true, start: Number(ordered[1]), items: items.map((parts) => parts.join('\n')) });
+        continue;
       }
-      tokens.push({ type: 'list', ordered: isOrdered, start: isOrdered ? Number(ordered[1]) : 1, items: items.map((parts) => parts.join('\n')) });
-      continue;
     }
     const body = [trimLine(line)];
     i++;
@@ -329,18 +370,16 @@ function findSingleStar(s, from) {
 }
 
 /** The characters that open an inline construct. */
-const CONSTRUCT = ['\\', '`', '*', '['];
+const CONSTRUCT_RE = /[\\`*[]/g;
 
 /** `s` rendered inline; `env.link(target)` is a link's href. */
 function inline(s, env) {
   const out = [];
   let i = 0;
   while (i < s.length) {
-    let j = s.length;
-    for (const ch of CONSTRUCT) {
-      const k = s.indexOf(ch, i);
-      if (k !== -1 && k < j) j = k;
-    }
+    CONSTRUCT_RE.lastIndex = i;
+    const m = CONSTRUCT_RE.exec(s);
+    const j = m === null ? s.length : m.index;
     if (j > i) out.push(escapeHtml(s.slice(i, j)));
     if (j === s.length) break;
     const code = s.charCodeAt(j);
@@ -437,7 +476,7 @@ function renderMarkdown(src, env, slugCache) {
       }
     }
   }
-  return { html: blocks.map((b) => `${b}\n`).join(''), toc, excerpt: excerpt ?? '' };
+  return { html: blocks.length === 0 ? '' : `${blocks.join('\n')}\n`, toc, excerpt: excerpt ?? '' };
 }
 
 // ---------------------------------------------------------------- templates
@@ -563,6 +602,65 @@ function truthy(v) {
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
+/** The root variables that are the same for every render in a build. */
+const STATIC_ROOTS = new Set(['site', 'tags', 'recent']);
+
+/**
+ * The root variables template `name` depends on, with loop variables resolved through
+ * `bindings` (loop var -> root vars of its collection). A template whose set is a subset
+ * of STATIC_ROOTS renders the same string for every page in the build, so its output can
+ * be cached. Cycles are guarded: a re-entered template reports a '__cycle__' root, which
+ * is never static, so a cyclic template is never cached.
+ */
+function templateDeps(templates, name, bindings, memo, visiting) {
+  const key = `${name}|${[...bindings.entries()].map(([k, v]) => `${k}=${[...v].sort().join(',')}`).join(';')}`;
+  if (memo.has(key)) return memo.get(key);
+  if (visiting.has(name)) return new Set(['__cycle__']);
+  const nodes = templates.get(name);
+  const deps = new Set();
+  memo.set(key, deps);
+  if (nodes === undefined) return deps;
+  visiting.add(name);
+  const addPath = (path, b) => {
+    const root = path[0];
+    if (b.has(root)) {
+      for (const d of b.get(root)) deps.add(d);
+    } else {
+      deps.add(root);
+    }
+  };
+  const walk = (ns, b) => {
+    for (const n of ns) {
+      if (n.kind === 'text') continue;
+      if (n.kind === 'var' || n.kind === 'raw') addPath(n.path, b);
+      else if (n.kind === 'if') {
+        addPath(n.path, b);
+        walk(n.then, b);
+        if (n.else) walk(n.else, b);
+      } else if (n.kind === 'for') {
+        addPath(n.path, b);
+        const inner = new Map(b);
+        const coll = new Set();
+        const root = n.path[0];
+        if (b.has(root)) {
+          for (const d of b.get(root)) coll.add(d);
+        } else {
+          coll.add(root);
+        }
+        inner.set(n.name, coll);
+        // `loop` (index/first/last/length) is bound by the for too, to the same collection.
+        inner.set('loop', coll);
+        walk(n.body, inner);
+      } else if (n.kind === 'include') {
+        for (const d of templateDeps(templates, n.name, b, memo, visiting)) deps.add(d);
+      }
+    }
+  };
+  walk(nodes, bindings);
+  visiting.delete(name);
+  return deps;
+}
+
 function renderNodes(nodes, scope, ctx, depth, out) {
   for (const n of nodes) {
     switch (n.kind) {
@@ -592,7 +690,22 @@ function renderNodes(nodes, scope, ctx, depth, out) {
       }
       case 'include': {
         const t = ctx.templates.get(n.name);
-        if (t !== undefined && depth < INCLUDE_DEPTH) renderNodes(t, scope, ctx, depth + 1, out);
+        if (t !== undefined && depth < INCLUDE_DEPTH) {
+          if (ctx.staticTemplates !== undefined && ctx.staticTemplates.has(n.name)) {
+            // Static: same string for every render in this build; cache it per depth.
+            const key = `${n.name}@${depth + 1}`;
+            let s = ctx.staticCache.get(key);
+            if (s === undefined) {
+              const tmp = [];
+              renderNodes(t, scope, ctx, depth + 1, tmp);
+              s = tmp.join('');
+              ctx.staticCache.set(key, s);
+            }
+            out.push(s);
+          } else {
+            renderNodes(t, scope, ctx, depth + 1, out);
+          }
+        }
         break;
       }
     }
@@ -625,6 +738,23 @@ export function build(input) {
     } catch (err) {
       if (!(err instanceof TemplateError)) throw err;
       report.push(err.message);
+    }
+  }
+  // Templates that depend only on build-level data (site/tags/recent) render the same
+  // string for every page; their output is cached per build in renderNodes.
+  const staticTemplates = new Set();
+  {
+    const memo = new Map();
+    for (const name of templates.keys()) {
+      const deps = templateDeps(templates, name, new Map(), memo, new Set());
+      let isStatic = true;
+      for (const d of deps) {
+        if (!STATIC_ROOTS.has(d)) {
+          isStatic = false;
+          break;
+        }
+      }
+      if (isStatic) staticTemplates.add(name);
     }
   }
   const slugCache = new Map();
@@ -795,7 +925,8 @@ export function build(input) {
   }
   function pageOf(s) {
     return {
-      ...cardOf(s),
+      // A post's card is already built (b.cards, step 7 start); reuse it instead of rebuilding it.
+      ...(s.post ? b.cards.get(s) : cardOf(s)),
       slug: s.slug,
       content: s.html,
       toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
@@ -811,7 +942,7 @@ export function build(input) {
     const site = { title: b.input.site.title, base_url: b.base };
     const allTags = b.tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
     const recent = b.posts.slice(0, b.input.site.recent).map((p) => b.cards.get(p));
-    const ctx = { templates: b.templates, escape: escapeHtml };
+    const ctx = { templates: b.templates, escape: escapeHtml, staticTemplates, staticCache: new Map() };
     const render = (name, vars) => {
       const nodes = b.templates.get(name);
       if (nodes === undefined) return null;
