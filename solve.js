@@ -636,58 +636,107 @@ function templateDeps(templates, name, bindings, memo, visiting) {
   return deps;
 }
 
-function renderNodes(nodes, scope, ctx, depth, out) {
-  for (const n of nodes) {
-    switch (n.kind) {
-      case 'text':
-        out.push(n.text);
-        break;
-      case 'var':
-        out.push(escapeHtml(textOf(lookup(scope, n.path))));
-        break;
-      case 'raw':
-        out.push(textOf(lookup(scope, n.path)));
-        break;
-      case 'if': {
-        const v = truthy(lookup(scope, n.path));
-        const branch = v !== n.not ? n.then : n.else;
-        if (branch !== null) renderNodes(branch, scope, ctx, depth, out);
-        break;
-      }
-      case 'for': {
-        const xs = lookup(scope, n.path);
-        if (!Array.isArray(xs)) break;
-        // One child scope per for-node, its vars mutated per iteration: the body is
-        // rendered synchronously, so nothing holds the scope past its iteration.
-        const childVars = {};
-        const child = { vars: childVars, parent: scope };
-        for (let k = 0; k < xs.length; k++) {
-          childVars[n.name] = xs[k];
-          childVars.loop = { index: k + 1, first: k === 0, last: k === xs.length - 1, length: xs.length };
-          renderNodes(n.body, child, ctx, depth, out);
+// Template bytecode (v2.0): parseTemplate's AST is compiled once per template into a flat
+// instruction array, then interpreted with a tight pc loop + explicit control stack. This
+// replaces the recursive tree walk (renderNodes) — same semantics, less interpretation
+// overhead. Opcodes: 0 text, 1 var (escaped), 2 raw, 3 if, 4 jump, 5 for, 6 endfor, 7 include.
+const T_TEXT = 0, T_VAR = 1, T_RAW = 2, T_IF = 3, T_JMP = 4, T_FOR = 5, T_ENDFOR = 6, T_INCLUDE = 7;
+
+/** An AST node list compiled to a flat instruction array. Jumps are absolute pcs. */
+function compileTemplate(nodes) {
+  const code = [];
+  const emit = (ins) => { code.push(ins); return code.length - 1; };
+  const walk = (ns) => {
+    for (const n of ns) {
+      if (n.kind === 'text') emit([T_TEXT, n.text]);
+      else if (n.kind === 'var') emit([T_VAR, n.path]);
+      else if (n.kind === 'raw') emit([T_RAW, n.path]);
+      else if (n.kind === 'if') {
+        const ifPc = emit([T_IF, n.path, n.not, -1, -1]);
+        walk(n.then);
+        if (n.else !== null) {
+          const jmpPc = emit([T_JMP, -1]);
+          code[ifPc][3] = code.length;
+          walk(n.else);
+          code[jmpPc][1] = code.length;
+          code[ifPc][4] = code.length;
+        } else {
+          code[ifPc][3] = -1;
+          code[ifPc][4] = code.length;
         }
-        break;
+      } else if (n.kind === 'for') {
+        const forPc = emit([T_FOR, n.name, n.path, -1]);
+        walk(n.body);
+        emit([T_ENDFOR, forPc]);
+        code[forPc][3] = code.length;
+      } else if (n.kind === 'include') {
+        emit([T_INCLUDE, n.name]);
       }
-      case 'include': {
-        const t = ctx.templates.get(n.name);
-        if (t !== undefined && depth < INCLUDE_DEPTH) {
-          if (ctx.staticTemplates !== undefined && ctx.staticTemplates.has(n.name)) {
-            // Static: same string for every render in this build; cache it per depth.
-            const key = `${n.name}@${depth + 1}`;
-            let s = ctx.staticCache.get(key);
-            if (s === undefined) {
-              const tmp = [];
-              renderNodes(t, scope, ctx, depth + 1, tmp);
-              s = tmp.join('');
-              ctx.staticCache.set(key, s);
-            }
-            out.push(s);
-          } else {
-            renderNodes(t, scope, ctx, depth + 1, out);
+    }
+  };
+  walk(nodes);
+  return code;
+}
+
+/** Interpret compiled template `code` in `scope`, appending strings to `out`. `ctx` holds the
+ *  compiled templates (`templates`, Map name -> code), the static-template set and cache. */
+function renderCode(code, scope, ctx, depth, out) {
+  const stack = [];
+  let pc = 0;
+  let curScope = scope;
+  while (pc < code.length) {
+    const ins = code[pc];
+    const op = ins[0];
+    if (op === T_TEXT) { out.push(ins[1]); pc++; }
+    else if (op === T_VAR) { out.push(escapeHtml(textOf(lookup(curScope, ins[1])))); pc++; }
+    else if (op === T_RAW) { out.push(textOf(lookup(curScope, ins[1]))); pc++; }
+    else if (op === T_IF) {
+      const cond = truthy(lookup(curScope, ins[1])) !== ins[2];
+      pc = cond ? pc + 1 : (ins[3] !== -1 ? ins[3] : ins[4]);
+    }
+    else if (op === T_JMP) { pc = ins[1]; }
+    else if (op === T_FOR) {
+      const xs = lookup(curScope, ins[2]);
+      if (!Array.isArray(xs) || xs.length === 0) { pc = ins[3]; continue; }
+      const childVars = {};
+      const child = { vars: childVars, parent: curScope };
+      stack.push({ xs, i: 0, bodyPc: pc + 1, endPc: ins[3], name: ins[1], child });
+      childVars[ins[1]] = xs[0];
+      childVars.loop = { index: 1, first: true, last: xs.length === 1, length: xs.length };
+      curScope = child;
+      pc++;
+    }
+    else if (op === T_ENDFOR) {
+      const fr = stack[stack.length - 1];
+      fr.i++;
+      if (fr.i < fr.xs.length) {
+        fr.child.vars[fr.name] = fr.xs[fr.i];
+        fr.child.vars.loop = { index: fr.i + 1, first: false, last: fr.i === fr.xs.length - 1, length: fr.xs.length };
+        pc = fr.bodyPc;
+      } else {
+        stack.pop();
+        curScope = fr.child.parent;
+        pc++;
+      }
+    }
+    else if (op === T_INCLUDE) {
+      const t = ctx.templates.get(ins[1]);
+      if (t !== undefined && depth < INCLUDE_DEPTH) {
+        if (ctx.staticTemplates !== undefined && ctx.staticTemplates.has(ins[1])) {
+          const key = `${ins[1]}@${depth + 1}`;
+          let s = ctx.staticCache.get(key);
+          if (s === undefined) {
+            const tmp = [];
+            renderCode(t, curScope, ctx, depth + 1, tmp);
+            s = tmp.join('');
+            ctx.staticCache.set(key, s);
           }
+          out.push(s);
+        } else {
+          renderCode(t, curScope, ctx, depth + 1, out);
         }
-        break;
       }
+      pc++;
     }
   }
 }
@@ -742,6 +791,7 @@ export function build(input) {
     input,
     base: input.site.base_url.replace(/\/+$/, ''),
     templates,
+    compiled: new Map([...templates].map(([n, nodes]) => [n, compileTemplate(nodes)])),
     sources: [],
     statics: [],
     bySource: new Map(),
@@ -922,15 +972,15 @@ export function build(input) {
     const site = { title: b.input.site.title, base_url: b.base };
     const allTags = b.tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
     const recent = b.posts.slice(0, b.input.site.recent).map((p) => b.cards.get(p));
-    const ctx = { templates: b.templates, escape: escapeHtml, staticTemplates, staticCache: new Map() };
+    const ctx = { templates: b.compiled, escape: escapeHtml, staticTemplates, staticCache: new Map() };
     // One shared build scope (site/tags/recent); each render's own vars hang off it
     // as a child scope, so no per-render spread of the build-level vars.
     const buildScope = { vars: { site, tags: allTags, recent }, parent: null };
     const render = (name, vars) => {
-      const nodes = b.templates.get(name);
-      if (nodes === undefined) return null;
+      const code = b.compiled.get(name);
+      if (code === undefined) return null;
       const out = [];
-      renderNodes(nodes, { vars, parent: buildScope }, ctx, 0, out);
+      renderCode(code, { vars, parent: buildScope }, ctx, 0, out);
       return out.join('');
     };
     for (const s of b.sources) b.output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });
