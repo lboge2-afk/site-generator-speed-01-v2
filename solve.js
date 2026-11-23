@@ -299,7 +299,7 @@ function renderMarkdown(src, env, slugCache) {
         }
       }
     } else if (c0 === 62) {
-      const body = [];
+      const body = [line.charCodeAt(1) === 32 ? line.slice(2) : line.slice(1)];
       while (true) {
         const nx = peek();
         if (nx === null || !QUOTE.test(nx)) break;
